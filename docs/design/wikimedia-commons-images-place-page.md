@@ -1,325 +1,191 @@
-# Design Specification
+# Place Page Images
 
-## Wikimedia Commons Images in Place Page 
+**Issue:** [#3252](https://github.com/organicmaps/organicmaps/issues/3252)
 
-**Related Issue:** [organicmaps/organicmaps#3252](https://github.com/organicmaps/organicmaps/issues/3252)
-**Data Source:** Existing `FMD_WIKIMEDIA_COMMONS` metadata (already in .mwm files)
-
----
-
-## 1. Overview
-
-This proposal adds optional visual enrichment to place pages by displaying images from Wikimedia Commons when available.
-
-The feature uses existing `wikimedia_commons=*` metadata already stored in `.mwm` files, fetches images on-demand, and respects all existing network and storage constraints.
+Display photos in place pages from multiple OSM-tagged sources, shown in a swipeable carousel. Images are fetched on-demand, cached locally, and fail silently if unavailable.
 
 ---
 
-## 2. Constraints & Requirements
+## Image Sources
 
-### 2.1 Architectural Constraints
+Five OSM tags are supported, in priority order:
 
-* Offline map data (`.mwm`) must not increase in size
-* No changes to map generation pipeline
-* No background network activity
-* No bulk or predictive downloads
-* Existing `NetworkPolicy` must be respected
-* Feature must fail silently
+| OSM tag | FMD field | Coverage | Auth required |
+|---|---|---|---|
+| `wikimedia_commons=File:X.jpg` | `FMD_WIKIMEDIA_COMMONS` (41, existing) | 350K nodes | No |
+| `panoramax=<UUID>` | `FMD_PANORAMAX` (51, new) | 93K nodes | No |
+| `wikipedia=en:Article` | (via wikiparser, no new FMD) | 2.2M nodes | No |
+| `image=https://...` | `FMD_IMAGE` (52, new) | 403K nodes | No |
+| `mapillary=<id>` | `FMD_MAPILLARY` (53, new) | 424K nodes | OAuth2 |
 
-### 2.2 UX Constraints
-
-* No new global settings
-* No mandatory user actions
-* UI must gracefully handle absence of images
-
+Mapillary is implemented last due to its OAuth2 requirement.
 
 ---
 
-## 3. Data Sources
+## Runtime Image Fetch
 
-### 3.1 Metadata Source
-
-* Uses existing `wikimedia_commons=*` metadata
-* Metadata is already stored in `.mwm` files
-* Only `File:*` values are supported
-* `Category:*` values are ignored
-
-No Wikidata runtime queries are used.
-
-### 3.2 Runtime Data Access
-
-**Layer:** Place page presentation layer (Android UI fragments).
-**Object:** `MapObject` — the runtime container for POI data.
-**Flow:**
-1. User opens place page
-2. Fragment reads `FMD_WIKIMEDIA_COMMONS` field from `MapObject`
-3. Returns Commons identifier (e.g., `"File:Example.jpg"`)
-4. Identifier is sent to Wikimedia Commons API to fetch actual image URL and attribution
-
-**Rationale for runtime API call:** CDN URLs for Commons images change over time and cannot be stored offline. Only the stable identifier is stored in `.mwm` files.
-
----
-
-## 4. Proposed Solution
-
-### 4.1 High-Level Description
-
-When a user opens a place page:
-
-* If an image for that place is already cached, it is displayed
-* Otherwise, and only if network access is permitted, a single image is fetched from Wikimedia Commons and cached locally
-
-Images are fetched **strictly on demand**, one per place. No image downloads are triggered by map movement, search results, viewport changes, or background processes.
-
-### 4.2 API Integration
-
-Send Commons identifier to:
+### Wikimedia Commons
 ```
-https://commons.wikimedia.org/w/api.php?action=query&titles=File:X.jpg&prop=imageinfo&iiprop=url|user|extmetadata&iiurlwidth=800
+GET commons.wikimedia.org/w/api.php
+  ?action=query&titles=File:X.jpg
+  &prop=imageinfo&iiprop=url|user|extmetadata
+  &iiurlwidth=800
+```
+Returns 800px thumbnail URL + author + license. No auth required.
+
+### Panoramax
+```
+GET api.panoramax.xyz/api/pictures/<UUID>/sd.jpg
+```
+Direct image URL. UUID validated in generator (36-char format). No auth required.
+
+### Wikipedia Lead Image
+Extracted by `descriptions_downloader.py` (wikiparser) during map generation.
+`beautify_page()` currently strips all images — extend it to capture the lead image `<figure>` `src`. Store filename alongside description text. No new FMD field needed; piggybacks on existing Wikipedia pipeline.
+
+### image= tag
+Raw URL stored as `FMD_IMAGE`. Validator in `osm2meta.cpp` accepts only `https://` and rejects known redirector/shortener domains. Displayed with "Source: image= tag" attribution. No license guarantee — display as-is with a note.
+
+### Mapillary
+```
+GET graph.mapillary.com/<id>?fields=thumb_1024_url&access_token=...
+```
+Requires app-level OAuth2 token. Implemented last. Token stored in build config, not bundled in open-source repo.
+
+**Privacy note:** Mapillary is owned by Meta. Every image fetch sends the Mapillary ID and user IP to Meta's servers. This is disclosed to the user via the existing NetworkPolicy prompt on mobile data.
+
+---
+
+## Generator Changes
+
+Follow the 16-file pattern from commit `1308b11d75` (original `wikimedia_commons` addition):
+
+**`libs/indexer/feature_meta.hpp`** — add new FMD IDs:
+```cpp
+FMD_PANORAMAX = 51,
+FMD_IMAGE = 52,
+FMD_MAPILLARY = 53,
 ```
 
-Response contains 800px thumbnail URL and attribution metadata (author, license). CDN URLs change over time, requiring runtime API call rather than storing URLs offline.
+**`libs/indexer/feature_meta.cpp`** — add to `TypeFromString()` and `ToString()`:
+```cpp
+else if (k == "panoramax")   outType = Metadata::FMD_PANORAMAX;
+else if (k == "image")       outType = Metadata::FMD_IMAGE;
+else if (k == "mapillary")   outType = Metadata::FMD_MAPILLARY;
+```
+
+**`generator/osm2meta.hpp/.cpp`** — add validators:
+```cpp
+static std::string ValidateAndFormat_panoramax(std::string v);
+// UUID format: 8-4-4-4-12 hex chars
+static std::string ValidateAndFormat_image(std::string v);
+// Accept https:// only, reject known shorteners
+static std::string ValidateAndFormat_mapillary(std::string v);
+// Accept numeric ID strings only
+```
+
+**`android/sdk/.../Metadata.java`** — mirror new FMD IDs, update `@IntRange(from=1, to=53)`.
+
+**`android/sdk/.../MapObject.java`** — add getters for new fields.
+
+Remaining files follow the same pattern: layout XML, `PlacePageView.java`, icon asset, `pygen.cpp`, `feature_list.cpp`, `metadata_parser_test.cpp`, Qt dialog.
 
 ---
 
-## 5. Runtime Flow
+## UI Design
 
-1. User opens a place page
-2. Application reads `FMD_WIKIMEDIA_COMMONS` metadata from `MapObject`
-3. Local cache is queried
-4. If cache hit → image is loaded
-5. If cache miss:
-   * Network policy is checked
-   * If permitted → single Wikimedia API request is made
-   * Image is downloaded on background worker thread
-   * Image is cached
-6. Image is displayed with attribution overlay
+### Carousel Section
 
----
+A new `PlacePageImagesFragment` is inserted **above** the Wikipedia section in the place page. It follows the same fragment architecture as `PlacePageWikipediaFragment`.
 
-## 6. Network Behavior
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/7c7812cb-45c5-422b-9010-5c8f09ddb361" width="416"/>
+  <img src="https://github.com/user-attachments/assets/51bac7da-35b3-4396-a936-ffb296844b92" width="389"/>
+</p>
 
-### 6.1 Network Integration
 
-Uses existing network policy system before every image fetch. **No new dialogs are added.**
+- **Single image available:** show image, no arrows, no dots
+- **Multiple sources provide images:** carousel with swipe gesture + dot indicator
+- **No images available:** section removed entirely, no empty space
+- **Loading:** small centered spinner, removed on success or failure
+- **Failure:** silent — section disappears, no error message
 
-| Connection Type | Behavior |
-|-----------------|----------|
-| **WiFi** | Fetch automatically |
-| **Mobile data (ALWAYS)** | Fetch automatically |
-| **Mobile data (ASK)** | Use existing system prompt, persist user's choice |
-| **Mobile data (NEVER)** | Image section hidden, no fetch attempted |
-| **Roaming (disabled)** | Image section hidden, no fetch attempted |
+### Image Sizing
 
-If network access is denied, the image section is removed silently. No error messages, no retries, no background queuing. This reuses the same permission flow already used by map downloads.
+- Width: match parent (full place page width)
+- Height: fixed 200dp
+- Scale: `centerCrop`
+- Format: RGB_565 to halve memory usage vs ARGB_8888
 
-### 6.2 Precedent
+### Attribution Bar
 
-This matches existing pattern used by map downloads.
+Semi-transparent overlay at image bottom (height 28dp, 11sp text):
+- Author name
+- License short name (e.g. CC BY-SA 4.0)
+- Tappable "View source" link → opens browser
 
 ---
 
-## 7. Local Storage
+## Network Behavior
 
-### 7.1 Image Identifier Storage
+All fetches go through existing `NetworkPolicy.checkNetworkPolicy()`. No new network dialogs.
 
-Image identifiers (like `"File:Example.jpg"`) are **already embedded** in `.mwm` files as `FMD_WIKIMEDIA_COMMONS` metadata. This metadata already exists—no changes to offline map data or generation pipeline. Actual images are NOT stored offline. They are fetched on-demand at runtime and cached locally after download.
+| State | Behavior |
+|---|---|
+| WiFi | Fetch automatically |
+| Mobile data (ALWAYS) | Fetch automatically |
+| Mobile data (ASK) | Existing prompt, user choice persisted |
+| Mobile data (NEVER) | Section hidden |
+| Offline | Section hidden |
+| Any fetch failure | Section hidden silently |
 
-### 7.2 Cache Implementation
-
-**Where stored:** Application-managed cache directory automatically cleaned when device storage is low.
-**Size limits:** 50 MB limit (approximately 200 cached images at ~250 KB each).
-**Eviction strategy:** LRU (Least Recently Used). When cache reaches the limit, oldest unused images are deleted to make room for new ones.
-**Key format:** SHA-256 hash of the Commons identifier ensures collision-free filenames.
-**Persistence:** Cache is intended to survive app restarts but remains expendable—Android OS may clear it under storage pressure without user intervention.
-
-
----
-
-## 8. UI Design
-
-A single optional image section inside the place page. If no image is available or loading fails, the section is removed entirely—no empty space, no error messages, no placeholders. The UI provides visual context for landmarks without disrupting the existing layout when images are absent.
-
-### 8.1 Image Display
-
-* **Image size**: 800px width thumbnail, height varies by aspect ratio
-* **Placement**: Dedicated section between "Bookmark" and "Wikipedia" sections
-* **Container**: Uses the same place page section container pattern as other sections
-* **Attribution**: Semi-transparent white bar at bottom showing:
-  * Author name
-  * License (CC BY-SA)
-  * "View on Commons" link
-* **Text size**: 11sp for attribution
-
-### 8.2 Full-Screen Viewing
-
-**No full-screen image viewer is included.** Tapping the image opens the device browser to the full Commons page. This matches the existing behavior of Wikipedia links in place pages. Adding an in-app image viewer would require additional UI complexity (zoom, pan, close button) and increase maintenance burden without significant user benefit.
-
-### 8.3 Multiple Images
-
-Only the first image is shown. No carousel (single image only), no preloading (additional images are not fetched), and no precaching (only the displayed image is cached). Multiple images would require UI controls (navigation dots, swipe gestures) and additional network requests, increasing complexity. A single representative image provides sufficient visual context.
-
-### 8.4 Loading & Failure
-
-* Loading indicator shown briefly (small spinner)
-* Timeout: short, fixed duration (initially ~5 seconds)
-* On failure:
-  * Section is removed
-  * No error messages shown
-  * No placeholder
-  * No "tap to load" button
-
-No automatic retries are scheduled; the image is re-attempted only if the user reopens the place page while online.
-
-### 8.5 User Interaction
-
-None. Image appears automatically when `NetworkPolicy` allows.
+Images fetch in order of priority. Once one image loads successfully, remaining are fetched lazily as user swipes.
 
 ---
 
-## 9. Resource Usage
+## Caching
 
-All numeric values are indicative defaults and subject to adjustment during implementation and review.
-
-### 9.1 Storage
-
-| Resource | Size | Notes |
-|----------|------|-------|
-| Offline storage | 0 bytes | Metadata already in .mwm files |
-| Code size | ~15 KB | Fragment class, API wrapper, cache manager |
-| Runtime memory | ~2-4 MB | One decoded 800px bitmap (RGB_565 format) |
-| Disk cache | 50 MB limit | ~200 cached images |
-
-### 9.2 Memory Management
-
-* Format: RGB_565 (2 bytes/pixel) not ARGB_8888 (4 bytes/pixel)
-* Lifecycle: Released when view is destroyed
-* Pressure: Responds to low memory callbacks
+- **Location:** App cache directory (OS-managed, cleared under storage pressure)
+- **Size limit:** 100 MB. Images vary widely in size — Wikimedia Commons thumbnails (800px) are typically 150–400 KB, Panoramax SD photos 300–800 KB. At 100 MB the cache holds roughly 150–300 real-world images depending on content type.
+- **Eviction:** LRU
+- **Key:** SHA-256 of source URL or identifier
+- **Memory:** Single decoded bitmap held while place page is visible, released on view destroy
 
 ---
 
-## 10. Offline Behavior
+## Implementation Phases
 
-| Condition | Result |
-|-----------|--------|
-| Cached image | Displayed |
-| Not cached + offline | No image shown |
-| Offline maps | Fully functional |
-| No network | Image section not shown |
-| NetworkPolicy denies | Image section not shown |
+1. **Phase 1 — Wikimedia Commons** (existing FMD, open API): Build `PlacePageImagesFragment`, carousel UI, caching, attribution bar. All infrastructure built here.
+2. **Phase 2 — Panoramax** (new FMD_PANORAMAX): Add generator support + plug into Phase 1 UI.
+3. **Phase 3 — Wikipedia lead image** (wikiparser): Modify `descriptions_downloader.py`, store image name alongside description, fetch via Wikimedia Commons API.
+4. **Phase 4 — image= tag** (new FMD_IMAGE): Add generator validator + plug in.
+5. **Phase 5 — Mapillary** (new FMD_MAPILLARY): OAuth2 token management + plug in.
 
-Images are treated as optional enrichment.
+Each phase is an independent PR. Phases 2-5 require only the generator additions and plugging a new URL resolver into the existing carousel.
 
 ---
 
-## 11. Privacy
+## Failure Handling
 
-### 11.1 Data Sent
-
-* Commons identifier (e.g., `"File:X.jpg"`)
-* Thumbnail width (800px)
-* No user ID, no cookies, no analytics
-
-### 11.2 Recipient
-
-Wikimedia Foundation API servers. Same domain already used for Wikipedia article fetching. Wikimedia is non-profit with public privacy policy (non-tracking, no ads).
-
-### 11.3 IP Visibility
-
-Standard for HTTP requests. User opts in via `NetworkPolicy` dialog on mobile data.
-
-### 11.4 Telemetry
-
-None. No tracking of which images are fetched.
-
----
-
-## 12. Explicit Non-Goals
-
-The following are **out of scope**:
-
-* **Bulk image downloads**: No regional or area-based downloads
-* **Background sync**: All downloads happen when user opens place page
-* **Carousel or galleries**: Only first image shown even if API returns multiple
-* **Full-screen image viewer**: Tapping image opens browser to Commons page (same as current wikimedia_commons link)
-* **Preloading**: Images fetched only when user opens place page, not preemptively
-* **Generator changes**: No modifications to map data generation pipeline
-* **Wikidata runtime integration**: No API calls to Wikidata. Only Commons identifiers already in .mwm files
-* **Category: support**: Only `File:X.jpg` processed. `Category:Y` values ignored (would require selecting one image from hundreds)
-
----
-
-## 13. Implementation Outline
-
-The following steps are subject to review:
-
-1. Create `PlacePageImagesFragment` following pattern from `PlacePageWikipediaFragment`
-2. Add fragment container to place page layout between bookmark and wikipedia sections
-3. Read `FMD_WIKIMEDIA_COMMONS` metadata from `MapObject` when place page opens
-4. Check network policy before HTTP request
-5. Execute API call and image decode on background worker thread
-6. Use existing HTTP client for network request
-7. Marshal decoded bitmap to main thread
-8. Release bitmap when view is destroyed
-
----
-
-## 14. Failure Handling
-
-All failures are silent to the user (no error toasts or dialogs):
+All failures are silent — no error toasts, no empty placeholders, no retry buttons.
 
 | Scenario | Behavior |
-|----------|----------|
-| No network connection | Image section not shown |
-| NetworkPolicy denies | Image section not shown |
-| API returns HTTP error | Spinner disappears after 5s timeout |
-| Invalid JSON response | Silent failure, no image shown |
-| Image download fails | Silent failure, no image shown |
-| Decode fails (corrupt image) | Silent failure, no image shown |
+|---|---|
+| No network / offline | Section not shown |
+| NetworkPolicy denies | Section not shown |
+| API returns error | Section removed silently |
+| Invalid/corrupt image | Section removed silently |
+| Image download timeout | Section removed silently |
 | Cache full | LRU eviction, new image cached |
-| Low memory event | In-memory bitmap released, re-fetched if place page reopened |
-
-**Rationale:** Image display is optional enrichment. Failure should not disrupt core map functionality or clutter UI with error messages.
+| Low memory | Bitmap released, re-fetched on next open |
 
 ---
 
-## 15. Trade-offs
+## Non-Goals
 
-* Does not improve first-time offline experience (only visited POIs have cached images)
-* Image coverage depends on OSM tagging quality (`wikimedia_commons=*` tag completeness)
-* Cache content is user-specific and incomplete
-* Limited visual coverage compared to bulk preloading
-
-These trade-offs are consistent with existing Wikipedia integration, which also provides content only for visited places when online.
-
----
-
-## 16. Rationale
-
-This design:
-
-* **Preserves offline-first principles**: Core map functionality unchanged when no network
-* **Scales naturally with user behavior**: Cache grows based on actual usage patterns
-* **Avoids infrastructure costs**: No hosting, no moderation, relies on Wikimedia Commons
-* **Minimizes maintenance burden**: Reuses existing networking, threading, and place page architecture
-* **Respects user control**: Network access governed by existing user preferences
-* **Fails gracefully**: Silent failure preserves UX consistency
-
----
-
-## 17. Precedent in Codebase
-
-This follows established patterns:
-
-* **Wikipedia content**: Pre-generated in .mwm files, displayed on-demand in place page fragment
-* **Map downloads**: User-initiated, foreground service with progress notifications
-* **NetworkPolicy usage**: Applied consistently across all network features
-* **Fragment architecture**: Modular place page sections using fragment containers
-
----
-
-## 18. Summary
-
-This specification defines an on-demand, user-initiated image enrichment mechanism for place pages, using existing Wikimedia Commons metadata and respecting all current architectural and policy constraints of Organic Maps.
-
-Images are treated as optional visual enrichment that enhances place recognition without compromising the offline-first experience.
+- No bulk/preemptive image downloads
+- No background sync
+- No in-app full-screen image viewer (tap opens browser)
+- No Wikidata runtime queries
+- No `Category:*` support for `wikimedia_commons` (would require selecting one image from hundreds)
+- No increase in `.mwm` file size
